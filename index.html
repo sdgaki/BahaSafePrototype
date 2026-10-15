@@ -430,7 +430,14 @@
       var onSnapshot = mods[1].onSnapshot;
 
       var firebaseApp = initializeApp(firebaseConfig);
-      var db = getFirestore(firebaseApp);
+      var db;
+      try {
+        // Auto-detects networks/browsers that stall Firestore's default streaming connection
+        // and switches to long-polling, which is what makes writes hang forever otherwise.
+        db = mods[1].initializeFirestore(firebaseApp, { experimentalAutoDetectLongPolling: true });
+      } catch(e) {
+        db = getFirestore(firebaseApp);
+      }
       reportsCollection = collection(db, "reports");
       window.__firestoreAddDoc = mods[1].addDoc;
       window.__firestoreServerTimestamp = mods[1].serverTimestamp;
@@ -462,12 +469,34 @@
   }
 
   // ---------- Geocoding + address parsing (OpenStreetMap's free Nominatim service) ----------
+  var GEOCODE_TIMEOUT_MS = 8000;
+  var WRITE_TIMEOUT_MS = 20000;
+
   function searchPlaces(text){
     var query = encodeURIComponent(text + ', Philippines');
     var url = 'https://nominatim.openstreetmap.org/search?format=json&addressdetails=1&limit=5&countrycodes=ph&q=' + query;
-    return fetch(url, { headers: { 'Accept': 'application/json' } })
+    var controller = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+    var timer = controller ? setTimeout(function(){ controller.abort(); }, GEOCODE_TIMEOUT_MS) : null;
+    return fetch(url, { headers: { 'Accept': 'application/json' }, signal: controller ? controller.signal : undefined })
       .then(function(res){ return res.json(); })
-      .catch(function(){ return []; });
+      .catch(function(){ return []; })
+      .then(function(results){
+        if(timer) clearTimeout(timer);
+        return results;
+      });
+  }
+
+  // Rejects (instead of waiting forever) if a request never answers.
+  function withTimeout(promise, ms){
+    return new Promise(function(resolve, reject){
+      var timer = setTimeout(function(){
+        var e = new Error('timeout');
+        e.code = 'timeout';
+        reject(e);
+      }, ms);
+      promise.then(function(v){ clearTimeout(timer); resolve(v); },
+                   function(err){ clearTimeout(timer); reject(err); });
+    });
   }
 
   // Fine-grained label for the map (barangay/district + city), comma-formatted from real address data.
@@ -819,11 +848,11 @@
     });
   });
 
-  function showToast(msg){
+  function showToast(msg, ms){
     var t = document.getElementById('toast');
     t.textContent = msg;
     t.classList.add('show');
-    setTimeout(function(){ t.classList.remove('show'); }, 2600);
+    setTimeout(function(){ t.classList.remove('show'); }, ms || 2600);
   }
 
   document.getElementById('reportForm').addEventListener('submit', function(e){
@@ -867,7 +896,7 @@
         createdAt: window.__firestoreServerTimestamp ? window.__firestoreServerTimestamp() : null
       };
       if(photoAtSubmit) newReport.photo = photoAtSubmit;
-      return window.__firestoreAddDoc(reportsCollection, newReport).then(function(){ return place; });
+      return withTimeout(window.__firestoreAddDoc(reportsCollection, newReport), WRITE_TIMEOUT_MS).then(function(){ return place; });
     }).then(function(place){
       document.getElementById('reportForm').reset();
       photoData = null;
@@ -890,7 +919,15 @@
       }
     }).catch(function(err){
       console.error('Failed to submit report:', err);
-      showToast('Something went wrong submitting your report. Please try again.');
+      var msg = "Something went wrong submitting your report. Please try again.";
+      if(err && err.code === 'permission-denied'){
+        msg = "The database rejected this report. Please tell the site owner (check the Firestore rules).";
+      } else if(err && err.code === 'timeout'){
+        msg = "Couldn't reach the database. Check your connection and try again.";
+      } else if(err && err.message && err.message.indexOf('Firebase is not ready') === 0){
+        msg = "Couldn't connect to the database. Refresh the page and try again.";
+      }
+      showToast(msg, 6000);
     }).finally(function(){
       submitBtn.disabled = false;
       submitBtn.textContent = 'Submit report';
